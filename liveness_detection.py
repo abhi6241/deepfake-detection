@@ -27,6 +27,9 @@ from typing import List, Tuple
 import cv2
 import mediapipe as mp
 import numpy as np
+import subprocess
+import json
+import os
 import torch
 import torchvision.transforms as T
 from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
@@ -162,7 +165,14 @@ def draw_overlay(frame: np.ndarray, text: str, status_color: Tuple[int, int, int
     cv2.putText(frame, title, ((w - tw) // 2, 40), font, font_scale, status_color, thickness, cv2.LINE_AA)
 
     # Blink counter at top-right
-    counter_text = f"Blinks: {blink_count}"
+    # Blink counter / risk display at top-right
+    # If blink_count is used as a risk score (100 for critical), display as Risk: 100%
+    if blink_count is None:
+        counter_text = ""
+    elif isinstance(blink_count, int) and blink_count >= 100:
+        counter_text = f"Risk: {blink_count}%"
+    else:
+        counter_text = f"Blinks: {blink_count}"
     (ctw, cth), _ = cv2.getTextSize(counter_text, font, 0.7, 2)
     cv2.putText(frame, counter_text, (w - ctw - 16, 40), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
@@ -282,6 +292,75 @@ def main():
             return
 
         tasks_mode = True
+
+    # SECURITY CHECK: enumerate available camera devices on macOS and detect virtual cameras
+    def enumerate_cameras_mac() -> List[str]:
+        """Return a list of camera device names as reported by system_profiler (macOS).
+
+        Uses `system_profiler SPCameraDataType -json` when available, otherwise falls back to
+        parsing the plain-text output. Returns an empty list on non-macOS or failure.
+        """
+        if os.name != 'posix':
+            return []
+
+        try:
+            out = subprocess.check_output(['system_profiler', 'SPCameraDataType', '-json'], text=True, stderr=subprocess.DEVNULL)
+            data = json.loads(out)
+            cameras = []
+            for entry in data.get('SPCameraDataType', []):
+                name = entry.get('_name') or entry.get('camera') or None
+                if not name:
+                    for v in entry.values():
+                        if isinstance(v, str):
+                            name = v
+                            break
+                if name:
+                    cameras.append(name)
+            return cameras
+        except Exception:
+            try:
+                out = subprocess.check_output(['system_profiler', 'SPCameraDataType'], text=True, stderr=subprocess.DEVNULL)
+                cameras = []
+                for line in out.splitlines():
+                    if line and not line.startswith(' ') and line.strip().endswith(':'):
+                        cameras.append(line.strip().rstrip(':'))
+                return cameras
+            except Exception:
+                return []
+
+    def is_suspicious_camera_name(name: str) -> bool:
+        if not name:
+            return False
+        s = name.lower()
+        tokens = ['virtual', 'obs', 'v-camera', 'v camera', 'manycam', 'snap camera', 'vcam', 'v-cam']
+        return any(t in s for t in tokens)
+
+    # Run camera enumeration & security check before opening the capture device
+    security_alert = False
+    risk_score = 0
+    selected_camera_name = None
+    try:
+        cameras = enumerate_cameras_mac()
+        try:
+            selected_index = int(os.environ.get('VIDEO_DEVICE_INDEX', '0'))
+        except Exception:
+            selected_index = 0
+
+        if cameras:
+            if 0 <= selected_index < len(cameras):
+                selected_camera_name = cameras[selected_index]
+            else:
+                selected_camera_name = cameras[0]
+
+            if is_suspicious_camera_name(selected_camera_name):
+                print("CRITICAL SECURITY ALERT: VIRTUAL CAMERA DETECTED ->", selected_camera_name)
+                security_alert = True
+                risk_score = 100
+        else:
+            selected_camera_name = None
+    except Exception:
+        security_alert = False
+        risk_score = 0
 
     # Use AVFoundation backend on macOS which tends to be more stable
     try:
@@ -426,15 +505,21 @@ def main():
         with df_result_lock:
             current_risk_score = df_result["prob"] * 100.0  # 0-100%
 
-        # Determine UI status
-        if blink_count > 0:
-            status_text = "LIVENESS VERIFIED"
-            status_color = (0, 180, 0)  # green-ish
+        # Determine UI status (security alert overrides liveness)
+        if 'security_alert' in locals() and security_alert:
+            status_text = "CRITICAL SECURITY ALERT: VIRTUAL CAMERA DETECTED"
+            status_color = (0, 0, 255)  # red
+            # Pass the risk_score into the overlay so it shows "Risk: 100%"
+            draw_overlay(frame, status_text, status_color, int(risk_score))
         else:
-            status_text = "SCANNING LIVENESS"
-            status_color = (0, 200, 255)  # yellow-ish (BGR)
+            if blink_count > 0:
+                status_text = "LIVENESS VERIFIED"
+                status_color = (0, 180, 0)  # green-ish
+            else:
+                status_text = "SCANNING LIVENESS"
+                status_color = (0, 200, 255)  # yellow-ish (BGR)
 
-        draw_overlay(frame, status_text, status_color, blink_count)
+            draw_overlay(frame, status_text, status_color, blink_count)
         draw_deepfake_overlay(frame, current_risk_score)
 
         # Show EAR and face presence as a small helper
