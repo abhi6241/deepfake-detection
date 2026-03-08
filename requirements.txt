@@ -1,3 +1,5 @@
 mediapipe>=0.10.0
 opencv-python>=4.5
 numpy>=1.21
+torch>=2.0
+torchvision>=0.15
