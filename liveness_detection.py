@@ -86,6 +86,75 @@ def landmarks_to_pixel_list(face_landmarks, image_w: int, image_h: int) -> List[
 
 
 # ---------------------------------------------------------------------------
+# Virtual Camera Detection (Zero Trust Allowlist)
+# ---------------------------------------------------------------------------
+CAMERA_ALLOWLIST = ['facetime', 'apple', 'built-in', 'macbook']
+
+
+def check_virtual_camera() -> Tuple[bool, str]:
+    """Query macOS hardware registry for cameras and verify against allowlist.
+
+    Returns (is_untrusted, camera_name).  A camera is trusted only if its
+    name contains a keyword from CAMERA_ALLOWLIST (case-insensitive).
+    Runs once at startup and does not block the real-time pipeline.
+    """
+    if os.name != 'posix':
+        return True, 'Unknown'
+
+    cameras: List[str] = []
+    try:
+        result = subprocess.run(
+            ['system_profiler', 'SPCameraDataType', '-json'],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            for entry in data.get('SPCameraDataType', []):
+                name = entry.get('_name') or entry.get('camera') or ''
+                if not name:
+                    for v in entry.values():
+                        if isinstance(v, str):
+                            name = v
+                            break
+                if name:
+                    cameras.append(name)
+    except Exception:
+        pass
+
+    # Fallback: plain-text parsing
+    if not cameras:
+        try:
+            result = subprocess.run(
+                ['system_profiler', 'SPCameraDataType'],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                stripped = line.strip()
+                if stripped and not line.startswith(' ') and stripped.endswith(':'):
+                    cameras.append(stripped.rstrip(':'))
+        except Exception:
+            pass
+
+    if not cameras:
+        return True, 'No camera detected'
+
+    # Pick the camera matching VIDEO_DEVICE_INDEX (default 0)
+    try:
+        idx = int(os.environ.get('VIDEO_DEVICE_INDEX', '0'))
+    except Exception:
+        idx = 0
+    cam_name = cameras[idx] if 0 <= idx < len(cameras) else cameras[0]
+
+    # Zero Trust: only trust cameras on the allowlist
+    cam_lower = cam_name.lower()
+    for trusted_keyword in CAMERA_ALLOWLIST:
+        if trusted_keyword in cam_lower:
+            return False, cam_name  # trusted native sensor
+
+    return True, cam_name  # not on allowlist → untrusted
+
+
+# ---------------------------------------------------------------------------
 # Deepfake Detector (HuggingFace ViT + MPS acceleration)
 # ---------------------------------------------------------------------------
 MODEL_ID = "prithivMLmods/Deep-Fake-Detector-v2-Model"
@@ -395,74 +464,14 @@ def main():
 
         tasks_mode = True
 
-    # SECURITY CHECK: enumerate available camera devices on macOS and detect virtual cameras
-    def enumerate_cameras_mac() -> List[str]:
-        """Return a list of camera device names as reported by system_profiler (macOS).
-
-        Uses `system_profiler SPCameraDataType -json` when available, otherwise falls back to
-        parsing the plain-text output. Returns an empty list on non-macOS or failure.
-        """
-        if os.name != 'posix':
-            return []
-
-        try:
-            out = subprocess.check_output(['system_profiler', 'SPCameraDataType', '-json'], text=True, stderr=subprocess.DEVNULL)
-            data = json.loads(out)
-            cameras = []
-            for entry in data.get('SPCameraDataType', []):
-                name = entry.get('_name') or entry.get('camera') or None
-                if not name:
-                    for v in entry.values():
-                        if isinstance(v, str):
-                            name = v
-                            break
-                if name:
-                    cameras.append(name)
-            return cameras
-        except Exception:
-            try:
-                out = subprocess.check_output(['system_profiler', 'SPCameraDataType'], text=True, stderr=subprocess.DEVNULL)
-                cameras = []
-                for line in out.splitlines():
-                    if line and not line.startswith(' ') and line.strip().endswith(':'):
-                        cameras.append(line.strip().rstrip(':'))
-                return cameras
-            except Exception:
-                return []
-
-    def is_suspicious_camera_name(name: str) -> bool:
-        if not name:
-            return False
-        s = name.lower()
-        tokens = ['virtual', 'obs', 'v-camera', 'v camera', 'manycam', 'snap camera', 'vcam', 'v-cam']
-        return any(t in s for t in tokens)
-
-    # Run camera enumeration & security check before opening the capture device
-    security_alert = False
-    risk_score = 0
-    selected_camera_name = None
-    try:
-        cameras = enumerate_cameras_mac()
-        try:
-            selected_index = int(os.environ.get('VIDEO_DEVICE_INDEX', '0'))
-        except Exception:
-            selected_index = 0
-
-        if cameras:
-            if 0 <= selected_index < len(cameras):
-                selected_camera_name = cameras[selected_index]
-            else:
-                selected_camera_name = cameras[0]
-
-            if is_suspicious_camera_name(selected_camera_name):
-                print("CRITICAL SECURITY ALERT: VIRTUAL CAMERA DETECTED ->", selected_camera_name)
-                security_alert = True
-                risk_score = 100
-        else:
-            selected_camera_name = None
-    except Exception:
-        security_alert = False
-        risk_score = 0
+    # --- Virtual camera security check (runs once, before capture) ---
+    is_untrusted_cam, cam_name = check_virtual_camera()
+    print(f"Detected camera: {cam_name}")
+    if is_untrusted_cam:
+        print(f"WARNING: Untrusted / external camera detected -> {cam_name}")
+        print("A +20% risk penalty will be applied to the deepfake score.")
+    else:
+        print(f"Trusted camera verified: {cam_name}")
 
     # Use AVFoundation backend on macOS which tends to be more stable
     try:
@@ -645,12 +654,14 @@ def main():
             current_risk_score = df_result["avg_score"]   # already 0-100%
             current_trend = df_result["trend"]
 
-        # Determine UI status (security alert overrides liveness)
-        if 'security_alert' in locals() and security_alert:
-            status_text = "CRITICAL SECURITY ALERT: VIRTUAL CAMERA DETECTED"
-            status_color = (0, 0, 255)  # red
-            # Pass the risk_score into the overlay so it shows "Risk: 100%"
-            draw_overlay(frame, status_text, status_color, int(risk_score))
+        # Determine UI status (untrusted camera warning + risk penalty)
+        if is_untrusted_cam:
+            # Apply +20% penalty to baseline risk score
+            current_risk_score = min(current_risk_score + 20.0, 100.0)
+            status_text = "EXTERNAL/VIRTUAL CAMERA - ELEVATED RISK"
+            status_color = (0, 165, 255)  # orange (BGR)
+            draw_overlay(frame, status_text, status_color, None)
+            draw_deepfake_overlay(frame, current_risk_score, current_trend)
         else:
             if blink_count > 0:
                 status_text = "LIVENESS VERIFIED"
