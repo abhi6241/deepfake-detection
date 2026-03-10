@@ -18,6 +18,7 @@ Dependencies:
     mediapipe, opencv-python, numpy, torch, torchvision
 
 """
+import collections
 import math
 import queue
 import threading
@@ -31,8 +32,9 @@ import subprocess
 import json
 import os
 import torch
-import torchvision.transforms as T
-from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+import torch.nn.functional as F
+from transformers import ViTForImageClassification, ViTImageProcessor
+from PIL import Image
 
 
 # Face Mesh landmark indices for eyes (MediaPipe Face Mesh)
@@ -83,44 +85,87 @@ def landmarks_to_pixel_list(face_landmarks, image_w: int, image_h: int) -> List[
 
 
 # ---------------------------------------------------------------------------
-# Deepfake Detector (EfficientNet-B0 placeholder)
+# Deepfake Detector (HuggingFace ViT + MPS acceleration)
 # ---------------------------------------------------------------------------
-class DeepfakeDetector:
-    """Wraps a pre-trained EfficientNet-B0 with a replaced binary head.
+MODEL_ID = "prithivMLmods/Deep-Fake-Detector-v2-Model"
 
-    The classification head outputs a single logit passed through sigmoid,
-    giving a *fake probability* in [0, 1].  Because the head is randomly
-    initialised, scores will be random until a fine-tuned checkpoint is
-    loaded.
+
+class DeepfakeDetector:
+    """Wraps a HuggingFace ViT fine-tuned for deepfake detection.
+
+    Uses ViTForImageClassification + ViTImageProcessor from the
+    'prithivMLmods/Deep-Fake-Detector-v2-Model' checkpoint.
+    Weights are downloaded automatically on first run.
+
+    Features:
+    - MPS (Apple Silicon GPU) acceleration when available, CPU fallback.
+    - 25-frame moving-average score buffer for temporal smoothing.
+    - Trend indicator (⬆️ rising / ⬇️ falling / ➖ stable).
     """
 
     def __init__(self) -> None:
-        self.device = torch.device("cpu")
-        model = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
-        # Replace classifier: original is (Dropout, Linear(1280, 1000))
-        model.classifier = torch.nn.Sequential(
-            torch.nn.Dropout(p=0.2, inplace=True),
-            torch.nn.Linear(1280, 1),
-            torch.nn.Sigmoid(),
-        )
-        model.eval()
-        self.model = model.to(self.device)
+        # --- Device selection: prefer Apple MPS, fall back to CPU ---
+        if torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
+        print(f"Neural Network running on: {self.device}")
 
-        self.preprocess = T.Compose([
-            T.ToPILImage(),
-            T.Resize((224, 224)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406],
-                        std=[0.229, 0.224, 0.225]),
-        ])
+        print(f"Downloading / loading deepfake model: {MODEL_ID} …")
+        self.processor = ViTImageProcessor.from_pretrained(MODEL_ID)
+        self.model = ViTForImageClassification.from_pretrained(MODEL_ID)
+        self.model.eval()
+        self.model.to(self.device)
+        print("Deepfake detector ready.")
+
+        # Determine which class index corresponds to "Fake" / "Deepfake"
+        self.fake_index = 0  # fallback
+        id2label = getattr(self.model.config, "id2label", {})
+        for idx, label in id2label.items():
+            if "fake" in str(label).lower():
+                self.fake_index = int(idx)
+                break
+
+        # --- Temporal smoothing state ---
+        self.score_buffer: collections.deque = collections.deque(maxlen=25)
+        self.current_avg_score: float = 0.0
+        self.trend: str = ""
+
+    # ----- public helpers --------------------------------------------------
+    def reset_buffer(self) -> None:
+        """Clear the rolling score buffer (call when face is lost)."""
+        self.score_buffer.clear()
+        self.current_avg_score = 0.0
+        self.trend = ""
 
     @torch.no_grad()
     def predict(self, face_bgr: np.ndarray) -> float:
-        """Return fake probability for an BGR face crop."""
+        """Return deepfake probability (0-1) for a BGR face crop."""
+        # Convert BGR numpy array → RGB PIL Image
         face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
-        tensor = self.preprocess(face_rgb).unsqueeze(0).to(self.device)
-        prob = self.model(tensor).item()
-        return float(prob)
+        pil_img = Image.fromarray(face_rgb)
+
+        inputs = self.processor(images=pil_img, return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(self.device)
+
+        outputs = self.model(pixel_values=pixel_values)
+        probs = F.softmax(outputs.logits, dim=1)
+        fake_prob = probs[0, self.fake_index].cpu().item()
+        return float(fake_prob)
+
+    def update_buffer(self, prob: float) -> None:
+        """Append a new probability, recompute moving average & trend."""
+        prev_avg = self.current_avg_score
+        self.score_buffer.append(prob * 100.0)  # store as percentage
+        self.current_avg_score = sum(self.score_buffer) / len(self.score_buffer)
+
+        delta = self.current_avg_score - prev_avg
+        if delta > 2.0:
+            self.trend = "⬆️"
+        elif delta < -2.0:
+            self.trend = "⬇️"
+        else:
+            self.trend = "➖"
 
 
 def _inference_worker(detector: DeepfakeDetector,
@@ -135,10 +180,12 @@ def _inference_worker(detector: DeepfakeDetector,
         face_crop, frame_id = item
         try:
             prob = detector.predict(face_crop)
+            detector.update_buffer(prob)
         except Exception:
             prob = 0.0
         with result_lock:
-            result_dict["prob"] = prob
+            result_dict["avg_score"] = detector.current_avg_score
+            result_dict["trend"] = detector.trend
             result_dict["frame_id"] = frame_id
 
 
@@ -177,10 +224,10 @@ def draw_overlay(frame: np.ndarray, text: str, status_color: Tuple[int, int, int
     cv2.putText(frame, counter_text, (w - ctw - 16, 40), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
 
-def draw_deepfake_overlay(frame: np.ndarray, risk_score: float) -> None:
+def draw_deepfake_overlay(frame: np.ndarray, risk_score: float, trend: str = "") -> None:
     """Draw a deepfake-risk panel at the bottom-left of *frame*."""
     h, w = frame.shape[:2]
-    panel_w, panel_h = 340, 60
+    panel_w, panel_h = 380, 60
     x0, y0 = 10, h - panel_h - 10
 
     # Semi-transparent background
@@ -188,15 +235,14 @@ def draw_deepfake_overlay(frame: np.ndarray, risk_score: float) -> None:
     cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y0 + panel_h), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
 
-    # Colour based on threshold
-    score_int = int(round(risk_score))
+    # Colour based on threshold (applied to the averaged score)
     if risk_score > 70:
         color = (0, 0, 255)  # red (BGR)
     else:
         color = (0, 200, 0)  # green (BGR)
 
     font = cv2.FONT_HERSHEY_SIMPLEX
-    label = f"DEEPFAKE RISK SCORE: {score_int}%"
+    label = f"DEEPFAKE RISK: {risk_score:.1f}% {trend}"
     cv2.putText(frame, label, (x0 + 10, y0 + 25), font, 0.65, color, 2, cv2.LINE_AA)
 
     # Progress bar
@@ -376,12 +422,11 @@ def main():
     blink_in_progress = False
 
     # --- Deepfake detector setup ---
-    print("Loading EfficientNet-B0 deepfake detector …")
     detector = DeepfakeDetector()
     print("Deepfake detector loaded.")
 
     df_job_queue: queue.Queue = queue.Queue(maxsize=1)
-    df_result: dict = {"prob": 0.0, "frame_id": -1}
+    df_result: dict = {"avg_score": 0.0, "trend": "", "frame_id": -1}
     df_result_lock = threading.Lock()
     df_thread = threading.Thread(
         target=_inference_worker,
@@ -391,7 +436,8 @@ def main():
     df_thread.start()
 
     frame_counter = 0
-    current_risk_score = 0.0  # displayed on every frame
+    current_risk_score = 0.0  # smoothed score displayed every frame
+    current_trend = ""       # trend indicator displayed every frame
     DEEPFAKE_INTERVAL = 15   # run inference every N frames
 
     print("Press 'q' to quit")
@@ -501,9 +547,14 @@ def main():
                 except queue.Full:
                     pass  # previous job still running; skip this frame
 
-        # Read latest risk score (lock-free read is fine for display)
+        # Reset score buffer when no face is visible (avoid stale data)
+        if not face_present:
+            detector.reset_buffer()
+
+        # Read latest smoothed risk score + trend
         with df_result_lock:
-            current_risk_score = df_result["prob"] * 100.0  # 0-100%
+            current_risk_score = df_result["avg_score"]   # already 0-100%
+            current_trend = df_result["trend"]
 
         # Determine UI status (security alert overrides liveness)
         if 'security_alert' in locals() and security_alert:
@@ -520,7 +571,7 @@ def main():
                 status_color = (0, 200, 255)  # yellow-ish (BGR)
 
             draw_overlay(frame, status_text, status_color, blink_count)
-        draw_deepfake_overlay(frame, current_risk_score)
+        draw_deepfake_overlay(frame, current_risk_score, current_trend)
 
         # Show EAR and face presence as a small helper
         helper_text = f"EAR: {ear:.3f}  Face: {'Yes' if face_present else 'No'}"

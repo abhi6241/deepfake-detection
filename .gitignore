@@ -4,6 +4,9 @@ venv/
 env/
 ENV/
 
+# Model weights (auto-downloaded at runtime)
+models/
+
 # Byte-compiled / cache
 __pycache__/
 *.py[cod]
