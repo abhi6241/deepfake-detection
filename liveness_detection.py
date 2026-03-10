@@ -21,6 +21,7 @@ Dependencies:
 import collections
 import math
 import queue
+import random
 import threading
 import time
 from typing import List, Tuple
@@ -274,6 +275,41 @@ def draw_proximity_warning(frame: np.ndarray) -> None:
     cv2.putText(frame, text, (tx, ty), font, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
 
 
+def draw_challenge_overlay(frame: np.ndarray, text: str, remaining: float,
+                           result: str = "") -> None:
+    """Draw a challenge instruction or result banner.
+
+    *result* is one of '', 'PASSED', 'FAILED'.
+    """
+    h, w = frame.shape[:2]
+    banner_w, banner_h = 520, 70
+    x0 = (w - banner_w) // 2
+    y0 = 70  # below the top status bar
+
+    if result == "PASSED":
+        bg_color = (0, 180, 0)    # green
+        fg_color = (255, 255, 255)
+        label = "CHALLENGE PASSED"
+    elif result == "FAILED":
+        bg_color = (0, 0, 220)    # red
+        fg_color = (255, 255, 255)
+        label = "CHALLENGE FAILED"
+    else:
+        bg_color = (200, 130, 0)  # dark cyan / teal-ish
+        fg_color = (255, 255, 255)
+        label = f"CHALLENGE: {text} ({remaining:.1f}s)"
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0, y0), (x0 + banner_w, y0 + banner_h), bg_color, -1)
+    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv2.getTextSize(label, font, 0.8, 2)
+    tx = x0 + (banner_w - tw) // 2
+    ty = y0 + (banner_h + th) // 2
+    cv2.putText(frame, label, (tx, ty), font, 0.8, fg_color, 2, cv2.LINE_AA)
+
+
 def main():
     # Settings
     EAR_THRESHOLD = 0.21  # below this is considered a blink/closed eye
@@ -462,6 +498,22 @@ def main():
     DEEPFAKE_INTERVAL = 15   # run inference every N frames
     MIN_FACE_PX = 120        # minimum face bbox size to run deepfake inference
 
+    # --- Challenge-Response Liveness ---
+    CHALLENGES = ['BLINK TWICE', 'TURN HEAD LEFT', 'TURN HEAD RIGHT', 'LOOK UP']
+    current_challenge = None          # active challenge string or None
+    challenge_start_time = 0.0        # time.time() when challenge was issued
+    challenge_duration = 4.0          # seconds to complete the challenge
+    challenge_passed = False          # True for a brief flash after passing
+    challenge_failed = False          # True for a brief flash after failing
+    challenge_result_time = 0.0       # when the pass/fail was recorded
+    CHALLENGE_RESULT_DISPLAY = 1.5    # seconds to show PASSED / FAILED
+    CHALLENGE_INTERVAL_MIN = 10.0     # min seconds between challenges
+    CHALLENGE_INTERVAL_MAX = 15.0     # max seconds between challenges
+    next_challenge_time = time.time() + random.uniform(CHALLENGE_INTERVAL_MIN, CHALLENGE_INTERVAL_MAX)
+    blinks_in_challenge = 0           # blink counter specific to challenge
+    initial_nose_pos = None           # (x, y) of nose tip at challenge start
+    HEAD_DISPLACEMENT_THRESH = 0.05   # fraction of frame width/height
+
     print("Press 'q' to quit")
 
     while True:
@@ -501,6 +553,9 @@ def main():
                 if ear >= EAR_THRESHOLD and blink_in_progress:
                     blink_count += 1
                     blink_in_progress = False
+                    # Track blinks during active challenge
+                    if current_challenge == 'BLINK TWICE':
+                        blinks_in_challenge += 1
 
                 # Optional: draw small circles for eye landmarks (clean, unobtrusive)
                 for idx in (LEFT_EYE + RIGHT_EYE):
@@ -543,6 +598,9 @@ def main():
                 if ear >= EAR_THRESHOLD and blink_in_progress:
                     blink_count += 1
                     blink_in_progress = False
+                    # Track blinks during active challenge
+                    if current_challenge == 'BLINK TWICE':
+                        blinks_in_challenge += 1
 
                 # Optional: draw small circles for eye landmarks (clean, unobtrusive)
                 for idx in (LEFT_EYE + RIGHT_EYE):
@@ -607,6 +665,85 @@ def main():
         # Proximity warning overlay
         if face_too_far:
             draw_proximity_warning(frame)
+
+        # ---------------------------------------------------------------
+        # Challenge-Response Liveness Logic
+        # ---------------------------------------------------------------
+        now = time.time()
+
+        # Show pass/fail result flash for CHALLENGE_RESULT_DISPLAY seconds
+        if challenge_passed and (now - challenge_result_time < CHALLENGE_RESULT_DISPLAY):
+            draw_challenge_overlay(frame, "", 0, result="PASSED")
+        elif challenge_failed and (now - challenge_result_time < CHALLENGE_RESULT_DISPLAY):
+            draw_challenge_overlay(frame, "", 0, result="FAILED")
+            # Force risk score to 100% during failure flash
+            current_risk_score = 100.0
+            draw_deepfake_overlay(frame, 100.0, "")
+        else:
+            # Clear result flags after display time
+            challenge_passed = False
+            challenge_failed = False
+
+            # --- Trigger a new challenge ---
+            if current_challenge is None and face_present and now >= next_challenge_time:
+                current_challenge = random.choice(CHALLENGES)
+                challenge_start_time = now
+                blinks_in_challenge = 0
+                # Record nose tip position (landmark index 1)
+                if len(pts) > 1:
+                    initial_nose_pos = (pts[1][0], pts[1][1])
+                else:
+                    initial_nose_pos = None
+
+            # --- Active challenge: verify & draw ---
+            if current_challenge is not None:
+                elapsed = now - challenge_start_time
+                remaining = max(challenge_duration - elapsed, 0.0)
+
+                # Check if challenge is completed
+                passed = False
+
+                if current_challenge == 'BLINK TWICE':
+                    if blinks_in_challenge >= 2:
+                        passed = True
+
+                elif current_challenge in ('TURN HEAD LEFT', 'TURN HEAD RIGHT'):
+                    if initial_nose_pos and face_present and len(pts) > 1:
+                        curr_nose_x = pts[1][0]
+                        dx = curr_nose_x - initial_nose_pos[0]
+                        threshold_px = w * HEAD_DISPLACEMENT_THRESH
+                        # Frame is already mirrored (cv2.flip), so
+                        # user's left = left in frame = negative dx
+                        if current_challenge == 'TURN HEAD LEFT' and dx < -threshold_px:
+                            passed = True
+                        elif current_challenge == 'TURN HEAD RIGHT' and dx > threshold_px:
+                            passed = True
+
+                elif current_challenge == 'LOOK UP':
+                    if initial_nose_pos and face_present and len(pts) > 1:
+                        curr_nose_y = pts[1][1]
+                        dy = initial_nose_pos[1] - curr_nose_y  # positive = moved up
+                        threshold_py = h * HEAD_DISPLACEMENT_THRESH
+                        if dy > threshold_py:
+                            passed = True
+
+                if passed:
+                    # Challenge completed successfully
+                    challenge_passed = True
+                    challenge_result_time = now
+                    current_challenge = None
+                    next_challenge_time = now + random.uniform(CHALLENGE_INTERVAL_MIN, CHALLENGE_INTERVAL_MAX)
+                    draw_challenge_overlay(frame, "", 0, result="PASSED")
+                elif remaining <= 0:
+                    # Timer expired — FAILED
+                    challenge_failed = True
+                    challenge_result_time = now
+                    current_challenge = None
+                    next_challenge_time = now + random.uniform(CHALLENGE_INTERVAL_MIN, CHALLENGE_INTERVAL_MAX)
+                    draw_challenge_overlay(frame, "", 0, result="FAILED")
+                else:
+                    # Still in progress — show countdown
+                    draw_challenge_overlay(frame, current_challenge, remaining)
 
         # Show EAR and face presence as a small helper
         helper_text = f"EAR: {ear:.3f}  Face: {'Yes' if face_present else 'No'}"
