@@ -5,3 +5,4 @@ torch>=2.0
 torchvision>=0.15
 transformers>=4.30
 huggingface-hub>=0.17
+grad-cam>=1.5

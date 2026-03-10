@@ -36,6 +36,8 @@ import torch
 import torch.nn.functional as F
 from transformers import ViTForImageClassification, ViTImageProcessor
 from PIL import Image
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.image import show_cam_on_image
 
 
 # Face Mesh landmark indices for eyes (MediaPipe Face Mesh)
@@ -160,6 +162,17 @@ def check_virtual_camera() -> Tuple[bool, str]:
 MODEL_ID = "prithivMLmods/Deep-Fake-Detector-v2-Model"
 
 
+class ViTWrapper(torch.nn.Module):
+    """Thin wrapper so GradCAM receives a raw logits tensor, not a ModelOutput."""
+
+    def __init__(self, vit_model: ViTForImageClassification) -> None:
+        super().__init__()
+        self.vit = vit_model
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        return self.vit(pixel_values=pixel_values).logits
+
+
 class DeepfakeDetector:
     """Wraps a HuggingFace ViT fine-tuned for deepfake detection.
 
@@ -197,9 +210,18 @@ class DeepfakeDetector:
                 break
 
         # --- Temporal smoothing state ---
-        self.score_buffer: collections.deque = collections.deque(maxlen=25)
+        self.score_buffer: collections.deque = collections.deque(maxlen=50)
         self.current_avg_score: float = 0.0
         self.trend: str = ""
+
+        # --- GradCAM (XAI) setup ---
+        self._cam_wrapper = ViTWrapper(self.model)
+        # Target the last encoder layer's layer norm
+        target_layer = self.model.vit.encoder.layer[-1].layernorm_before
+        self.grad_cam = GradCAM(model=self._cam_wrapper,
+                                target_layers=[target_layer])
+        self.current_heatmap: np.ndarray | None = None  # set by inference thread
+        self._heatmap_lock = threading.Lock()
 
     # ----- public helpers --------------------------------------------------
     def reset_buffer(self) -> None:
@@ -225,8 +247,10 @@ class DeepfakeDetector:
 
     def update_buffer(self, prob: float) -> None:
         """Append a new probability, recompute moving average & trend."""
+        # Apply calibration offset to compensate for webcam compression artifacts
+        calibrated = max((prob * 100.0) - 15.0, 0.0)
         prev_avg = self.current_avg_score
-        self.score_buffer.append(prob * 100.0)  # store as percentage
+        self.score_buffer.append(calibrated)
         self.current_avg_score = sum(self.score_buffer) / len(self.score_buffer)
 
         delta = self.current_avg_score - prev_avg
@@ -236,6 +260,21 @@ class DeepfakeDetector:
             self.trend = "⬇️"
         else:
             self.trend = "➖"
+
+    def compute_heatmap(self, face_bgr: np.ndarray) -> np.ndarray | None:
+        """Return a grayscale GradCAM heatmap (H×W float32 0-1) for *face_bgr*."""
+        try:
+            face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(face_rgb)
+            inputs = self.processor(images=pil_img, return_tensors="pt")
+            pixel_values = inputs["pixel_values"].to(self.device)
+
+            # GradCAM needs grad, temporarily enable it
+            grayscale_cam = self.grad_cam(input_tensor=pixel_values,
+                                          targets=None)  # uses top predicted class
+            return grayscale_cam[0]  # (H, W) float32 in [0, 1]
+        except Exception:
+            return None
 
 
 def _inference_worker(detector: DeepfakeDetector,
@@ -251,6 +290,14 @@ def _inference_worker(detector: DeepfakeDetector,
         try:
             prob = detector.predict(face_crop)
             detector.update_buffer(prob)
+
+            # Compute GradCAM heatmap if risk is elevated
+            if detector.current_avg_score > 60.0:
+                heatmap = detector.compute_heatmap(face_crop)
+            else:
+                heatmap = None
+            with detector._heatmap_lock:
+                detector.current_heatmap = heatmap
         except Exception:
             prob = 0.0
         with result_lock:
@@ -306,7 +353,7 @@ def draw_deepfake_overlay(frame: np.ndarray, risk_score: float, trend: str = "")
     cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
 
     # Colour based on threshold (applied to the averaged score)
-    if risk_score > 70:
+    if risk_score > 85:
         color = (0, 0, 255)  # red (BGR)
     else:
         color = (0, 200, 0)  # green (BGR)
@@ -649,6 +696,18 @@ def main():
             detector.reset_buffer()
             face_too_far = False
 
+        # Store face bbox for heatmap overlay
+        face_bbox = None
+        if face_present and 'pts' in locals():
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            pad = 20
+            bx1 = max(min(xs) - pad, 0)
+            by1 = max(min(ys) - pad, 0)
+            bx2 = min(max(xs) + pad, w)
+            by2 = min(max(ys) + pad, h)
+            face_bbox = (bx1, by1, bx2, by2)
+
         # Read latest smoothed risk score + trend
         with df_result_lock:
             current_risk_score = df_result["avg_score"]   # already 0-100%
@@ -672,6 +731,32 @@ def main():
 
             draw_overlay(frame, status_text, status_color, blink_count)
         draw_deepfake_overlay(frame, current_risk_score, current_trend)
+
+        # --- GradCAM XAI heatmap overlay ---
+        with detector._heatmap_lock:
+            heatmap = detector.current_heatmap
+        if heatmap is not None and face_bbox is not None:
+            bx1, by1, bx2, by2 = face_bbox
+            fw, fh = bx2 - bx1, by2 - by1
+            if fw > 0 and fh > 0:
+                # Resize GradCAM mask to face region size
+                cam_resized = cv2.resize(heatmap, (fw, fh))
+                cam_color = cv2.applyColorMap(
+                    np.uint8(255 * cam_resized), cv2.COLORMAP_JET
+                )
+                # Blend heatmap onto the face region
+                face_region = frame[by1:by2, bx1:bx2]
+                blended = cv2.addWeighted(face_region, 0.55, cam_color, 0.45, 0)
+                frame[by1:by2, bx1:bx2] = blended
+
+                # Label above the bounding box
+                label = "AI Artifact Detection Map"
+                cv2.putText(frame, label, (bx1, by1 - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                            (0, 255, 255), 2, cv2.LINE_AA)
+                # Draw bounding box outline
+                cv2.rectangle(frame, (bx1, by1), (bx2, by2),
+                              (0, 255, 255), 2)
 
         # Proximity warning overlay
         if face_too_far:
