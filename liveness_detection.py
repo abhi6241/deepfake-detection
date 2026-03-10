@@ -254,6 +254,26 @@ def draw_deepfake_overlay(frame: np.ndarray, risk_score: float, trend: str = "")
         cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h_px), color, -1)
 
 
+def draw_proximity_warning(frame: np.ndarray) -> None:
+    """Draw a prominent 'MOVE CLOSER' warning banner at the centre of *frame*."""
+    h, w = frame.shape[:2]
+    banner_w, banner_h = 420, 50
+    x0 = (w - banner_w) // 2
+    y0 = (h - banner_h) // 2
+
+    # Semi-transparent yellow background
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0, y0), (x0 + banner_w, y0 + banner_h), (0, 200, 255), -1)
+    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    text = "WARNING: MOVE CLOSER TO CAMERA"
+    (tw, th), _ = cv2.getTextSize(text, font, 0.7, 2)
+    tx = x0 + (banner_w - tw) // 2
+    ty = y0 + (banner_h + th) // 2
+    cv2.putText(frame, text, (tx, ty), font, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
+
+
 def main():
     # Settings
     EAR_THRESHOLD = 0.21  # below this is considered a blink/closed eye
@@ -438,7 +458,9 @@ def main():
     frame_counter = 0
     current_risk_score = 0.0  # smoothed score displayed every frame
     current_trend = ""       # trend indicator displayed every frame
+    face_too_far = False     # proximity gate state (persists between checks)
     DEEPFAKE_INTERVAL = 15   # run inference every N frames
+    MIN_FACE_PX = 120        # minimum face bbox size to run deepfake inference
 
     print("Press 'q' to quit")
 
@@ -539,17 +561,26 @@ def main():
             y1 = max(min(ys) - pad, 0)
             x2 = min(max(xs) + pad, w)
             y2 = min(max(ys) + pad, h)
-            face_crop = frame[y1:y2, x1:x2]
-            if face_crop.size > 0:
-                # Non-blocking put: drop old job if queue full
-                try:
-                    df_job_queue.put_nowait((face_crop.copy(), frame_counter))
-                except queue.Full:
-                    pass  # previous job still running; skip this frame
+            face_w = x2 - x1
+            face_h = y2 - y1
 
-        # Reset score buffer when no face is visible (avoid stale data)
+            # Proximity gate: skip inference if face is too small
+            if face_w < MIN_FACE_PX or face_h < MIN_FACE_PX:
+                face_too_far = True
+            else:
+                face_too_far = False
+                face_crop = frame[y1:y2, x1:x2]
+                if face_crop.size > 0:
+                    # Non-blocking put: drop old job if queue full
+                    try:
+                        df_job_queue.put_nowait((face_crop.copy(), frame_counter))
+                    except queue.Full:
+                        pass  # previous job still running; skip this frame
+
+        # Reset score buffer and proximity flag when no face is visible
         if not face_present:
             detector.reset_buffer()
+            face_too_far = False
 
         # Read latest smoothed risk score + trend
         with df_result_lock:
@@ -572,6 +603,10 @@ def main():
 
             draw_overlay(frame, status_text, status_color, blink_count)
         draw_deepfake_overlay(frame, current_risk_score, current_trend)
+
+        # Proximity warning overlay
+        if face_too_far:
+            draw_proximity_warning(frame)
 
         # Show EAR and face presence as a small helper
         helper_text = f"EAR: {ear:.3f}  Face: {'Yes' if face_present else 'No'}"
