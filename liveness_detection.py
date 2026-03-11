@@ -46,6 +46,12 @@ from pytorch_grad_cam.utils.image import show_cam_on_image
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [263, 387, 385, 362, 380, 373]
 
+# --- Unified Fraud Risk Engine weights ---
+W_DEEPFAKE = 0.45
+W_LIVENESS = 0.30
+W_CHALLENGE = 0.15
+W_CAMERA = 0.10
+
 
 def euclidean(a: Tuple[float, float], b: Tuple[float, float]) -> float:
     ax, ay = a
@@ -248,7 +254,7 @@ class DeepfakeDetector:
     def update_buffer(self, prob: float) -> None:
         """Append a new probability, recompute moving average & trend."""
         # Apply calibration offset to compensate for webcam compression artifacts
-        calibrated = max((prob * 100.0) - 15.0, 0.0)
+        calibrated = max((prob * 100.0) - 5.0, 0.0)
         prev_avg = self.current_avg_score
         self.score_buffer.append(calibrated)
         self.current_avg_score = sum(self.score_buffer) / len(self.score_buffer)
@@ -329,8 +335,6 @@ def draw_overlay(frame: np.ndarray, text: str, status_color: Tuple[int, int, int
     cv2.putText(frame, title, ((w - tw) // 2, 40), font, font_scale, status_color, thickness, cv2.LINE_AA)
 
     # Blink counter at top-right
-    # Blink counter / risk display at top-right
-    # If blink_count is used as a risk score (100 for critical), display as Risk: 100%
     if blink_count is None:
         counter_text = ""
     elif isinstance(blink_count, int) and blink_count >= 100:
@@ -339,6 +343,50 @@ def draw_overlay(frame: np.ndarray, text: str, status_color: Tuple[int, int, int
         counter_text = f"Blinks: {blink_count}"
     (ctw, cth), _ = cv2.getTextSize(counter_text, font, 0.7, 2)
     cv2.putText(frame, counter_text, (w - ctw - 16, 40), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+
+def draw_unified_risk_panel(frame: np.ndarray, final_pct: float,
+                            s_df: float, s_live: float,
+                            s_chal: float, s_cam: float) -> None:
+    """Draw the Unified Fraud Risk panel at the bottom of the frame."""
+    h, w = frame.shape[:2]
+    panel_w, panel_h = 500, 95
+    x0 = (w - panel_w) // 2
+    y0 = h - panel_h - 10
+
+    # Determine tier
+    if final_pct < 35:
+        bg_color = (0, 130, 0)       # green
+        label = "STATUS: SAFE (Low Risk)"
+    elif final_pct < 70:
+        bg_color = (0, 180, 230)     # yellow/orange BGR
+        label = "STATUS: SUSPICIOUS (Review Required)"
+    else:
+        bg_color = (0, 0, 200)       # red
+        label = "STATUS: HIGH RISK (Fraud Detected)"
+
+    # Panel background
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y0 + panel_h), bg_color, -1)
+    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    # Title + percentage
+    title = f"{label}  {final_pct:.1f}%"
+    cv2.putText(frame, title, (x0 + 10, y0 + 25), font, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # Progress bar
+    bar_x, bar_y = x0 + 10, y0 + 38
+    bar_w, bar_h_px = panel_w - 20, 14
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h_px), (50, 50, 50), -1)
+    fill_w = int(bar_w * min(max(final_pct, 0), 100) / 100)
+    if fill_w > 0:
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h_px), (255, 255, 255), -1)
+
+    # Signal breakdown
+    breakdown = f"[DF:{s_df:.2f} | Live:{s_live:.2f} | Chal:{s_chal:.2f} | Cam:{s_cam:.2f}]"
+    cv2.putText(frame, breakdown, (x0 + 10, y0 + 75), font, 0.5, (220, 220, 220), 1, cv2.LINE_AA)
 
 
 def draw_deepfake_overlay(frame: np.ndarray, risk_score: float, trend: str = "") -> None:
@@ -570,6 +618,11 @@ def main():
     initial_nose_pos = None           # (x, y) of nose tip at challenge start
     HEAD_DISPLACEMENT_THRESH = 0.05   # fraction of frame width/height
 
+    # --- Unified Risk Engine state ---
+    last_blink_time = time.time()     # tracks recency of last blink
+    prev_blink_count = 0              # to detect new blinks
+    last_challenge_result = 'PENDING' # 'PASSED', 'FAILED', or 'PENDING'
+
     print("Press 'q' to quit")
 
     while True:
@@ -713,24 +766,64 @@ def main():
             current_risk_score = df_result["avg_score"]   # already 0-100%
             current_trend = df_result["trend"]
 
-        # Determine UI status (untrusted camera warning + risk penalty)
-        if is_untrusted_cam:
-            # Apply +20% penalty to baseline risk score
-            current_risk_score = min(current_risk_score + 20.0, 100.0)
-            status_text = "EXTERNAL/VIRTUAL CAMERA - ELEVATED RISK"
-            status_color = (0, 165, 255)  # orange (BGR)
-            draw_overlay(frame, status_text, status_color, None)
-            draw_deepfake_overlay(frame, current_risk_score, current_trend)
+        # ================================================================
+        # Unified Fraud Risk Engine — aggregate all signals
+        # ================================================================
+        now_risk = time.time()
+
+        # S_df: deepfake signal (0-1)
+        s_df = min(current_risk_score / 100.0, 1.0)
+
+        # S_live: liveness signal based on time since last blink
+        time_since_blink = now_risk - last_blink_time
+        if not face_present:
+            s_live = 1.0
+        elif time_since_blink < 3.0:
+            s_live = 0.0
+        elif time_since_blink < 8.0:
+            s_live = (time_since_blink - 3.0) / 5.0  # linear 0→1
+        else:
+            s_live = 1.0
+
+        # S_chal: challenge signal
+        if last_challenge_result == 'PASSED':
+            s_chal = 0.0
+        elif last_challenge_result == 'FAILED':
+            s_chal = 1.0
+        else:  # PENDING
+            s_chal = 0.5
+
+        # S_cam: camera trust signal
+        s_cam = 1.0 if is_untrusted_cam else 0.0
+
+        # Weighted aggregation
+        raw_risk = (s_df * W_DEEPFAKE + s_live * W_LIVENESS +
+                    s_chal * W_CHALLENGE + s_cam * W_CAMERA)
+
+        # Critical penalty override (high-confidence deepfake, virtual cam, or failed challenge)
+        if s_df > 0.70 or s_cam == 1.0 or s_chal == 1.0:
+            raw_risk = max(raw_risk, 0.85)
+
+        final_risk_score = raw_risk * 100.0
+
+        # --- Draw top status bar ---
+        if final_risk_score >= 70:
+            status_text = "HIGH RISK - FRAUD DETECTED"
+            status_color = (0, 0, 255)
+        elif final_risk_score >= 35:
+            status_text = "SUSPICIOUS - REVIEW REQUIRED"
+            status_color = (0, 180, 230)
         else:
             if blink_count > 0:
                 status_text = "LIVENESS VERIFIED"
-                status_color = (0, 180, 0)  # green-ish
+                status_color = (0, 180, 0)
             else:
                 status_text = "SCANNING LIVENESS"
-                status_color = (0, 200, 255)  # yellow-ish (BGR)
+                status_color = (0, 200, 255)
+        draw_overlay(frame, status_text, status_color, blink_count)
 
-            draw_overlay(frame, status_text, status_color, blink_count)
-        draw_deepfake_overlay(frame, current_risk_score, current_trend)
+        # --- Draw unified risk panel ---
+        draw_unified_risk_panel(frame, final_risk_score, s_df, s_live, s_chal, s_cam)
 
         # --- GradCAM XAI heatmap overlay ---
         with detector._heatmap_lock:
@@ -739,24 +832,16 @@ def main():
             bx1, by1, bx2, by2 = face_bbox
             fw, fh = bx2 - bx1, by2 - by1
             if fw > 0 and fh > 0:
-                # Resize GradCAM mask to face region size
                 cam_resized = cv2.resize(heatmap, (fw, fh))
                 cam_color = cv2.applyColorMap(
                     np.uint8(255 * cam_resized), cv2.COLORMAP_JET
                 )
-                # Blend heatmap onto the face region
                 face_region = frame[by1:by2, bx1:bx2]
                 blended = cv2.addWeighted(face_region, 0.55, cam_color, 0.45, 0)
                 frame[by1:by2, bx1:bx2] = blended
-
-                # Label above the bounding box
-                label = "AI Artifact Detection Map"
-                cv2.putText(frame, label, (bx1, by1 - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                            (0, 255, 255), 2, cv2.LINE_AA)
-                # Draw bounding box outline
-                cv2.rectangle(frame, (bx1, by1), (bx2, by2),
-                              (0, 255, 255), 2)
+                cv2.putText(frame, "AI Artifact Detection Map", (bx1, by1 - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
+                cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 255, 255), 2)
 
         # Proximity warning overlay
         if face_too_far:
@@ -767,14 +852,16 @@ def main():
         # ---------------------------------------------------------------
         now = time.time()
 
+        # Track last blink time for liveness signal
+        if blink_count > prev_blink_count:
+            last_blink_time = now
+            prev_blink_count = blink_count
+
         # Show pass/fail result flash for CHALLENGE_RESULT_DISPLAY seconds
         if challenge_passed and (now - challenge_result_time < CHALLENGE_RESULT_DISPLAY):
             draw_challenge_overlay(frame, "", 0, result="PASSED")
         elif challenge_failed and (now - challenge_result_time < CHALLENGE_RESULT_DISPLAY):
             draw_challenge_overlay(frame, "", 0, result="FAILED")
-            # Force risk score to 100% during failure flash
-            current_risk_score = 100.0
-            draw_deepfake_overlay(frame, 100.0, "")
         else:
             # Clear result flags after display time
             challenge_passed = False
@@ -785,7 +872,6 @@ def main():
                 current_challenge = random.choice(CHALLENGES)
                 challenge_start_time = now
                 blinks_in_challenge = 0
-                # Record nose tip position (landmark index 1)
                 if len(pts) > 1:
                     initial_nose_pos = (pts[1][0], pts[1][1])
                 else:
@@ -796,7 +882,6 @@ def main():
                 elapsed = now - challenge_start_time
                 remaining = max(challenge_duration - elapsed, 0.0)
 
-                # Check if challenge is completed
                 passed = False
 
                 if current_challenge == 'BLINK TWICE':
@@ -808,8 +893,6 @@ def main():
                         curr_nose_x = pts[1][0]
                         dx = curr_nose_x - initial_nose_pos[0]
                         threshold_px = w * HEAD_DISPLACEMENT_THRESH
-                        # Frame is already mirrored (cv2.flip), so
-                        # user's left = left in frame = negative dx
                         if current_challenge == 'TURN HEAD LEFT' and dx < -threshold_px:
                             passed = True
                         elif current_challenge == 'TURN HEAD RIGHT' and dx > threshold_px:
@@ -818,32 +901,31 @@ def main():
                 elif current_challenge == 'LOOK UP':
                     if initial_nose_pos and face_present and len(pts) > 1:
                         curr_nose_y = pts[1][1]
-                        dy = initial_nose_pos[1] - curr_nose_y  # positive = moved up
+                        dy = initial_nose_pos[1] - curr_nose_y
                         threshold_py = h * HEAD_DISPLACEMENT_THRESH
                         if dy > threshold_py:
                             passed = True
 
                 if passed:
-                    # Challenge completed successfully
                     challenge_passed = True
                     challenge_result_time = now
                     current_challenge = None
+                    last_challenge_result = 'PASSED'
                     next_challenge_time = now + random.uniform(CHALLENGE_INTERVAL_MIN, CHALLENGE_INTERVAL_MAX)
                     draw_challenge_overlay(frame, "", 0, result="PASSED")
                 elif remaining <= 0:
-                    # Timer expired — FAILED
                     challenge_failed = True
                     challenge_result_time = now
                     current_challenge = None
+                    last_challenge_result = 'FAILED'
                     next_challenge_time = now + random.uniform(CHALLENGE_INTERVAL_MIN, CHALLENGE_INTERVAL_MAX)
                     draw_challenge_overlay(frame, "", 0, result="FAILED")
                 else:
-                    # Still in progress — show countdown
                     draw_challenge_overlay(frame, current_challenge, remaining)
 
         # Show EAR and face presence as a small helper
         helper_text = f"EAR: {ear:.3f}  Face: {'Yes' if face_present else 'No'}"
-        cv2.putText(frame, helper_text, (12, h - 88), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(frame, helper_text, (12, h - 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
 
         cv2.imshow("Liveness Detection", frame)
 
