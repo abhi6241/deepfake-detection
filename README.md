@@ -15,7 +15,9 @@ A real-time computer vision system that combines **liveness detection** (blink-b
 | **Liveness Detection** | Tracks facial landmarks via MediaPipe and detects real blinks using Eye Aspect Ratio (EAR) |
 | **Deepfake Risk Scoring** | Uses a fine-tuned ViT model ([Deep-Fake-Detector-v2](https://huggingface.co/prithivMLmods/Deep-Fake-Detector-v2-Model)) to classify face crops as real or fake |
 | **MPS GPU Acceleration** | Automatically uses Apple Silicon GPU (Metal Performance Shaders) when available, falls back to CPU |
-| **Temporal Smoothing** | 25-frame moving average on risk scores to prevent jitter, with trend indicators (⬆️/⬇️/➖) |
+| **Temporal Smoothing** | 50-frame moving average on risk scores to prevent jitter, with trend indicators (⬆️/⬇️/➖) and a small calibration offset |
+| **Challenge-Response** | Randomized challenge prompts (blink twice, turn head, look up) issued periodically to strengthen liveness guarantees |
+| **GradCAM XAI** | When risk is elevated, an explainability heatmap (GradCAM) is computed and blended over the face crop |
 | **Proximity Gate** | Skips inference when the face is too far (< 120px bounding box) to prevent false positives from low-res crops |
 | **Virtual Camera Detection** | Detects virtual cameras (OBS, ManyCam, Snap Camera, etc.) on macOS and raises a security alert |
 | **Non-Blocking Inference** | Deepfake model runs on a background thread every 15 frames — the UI never freezes |
@@ -39,8 +41,8 @@ A real-time computer vision system that combines **liveness detection** (blink-b
                                                       │
                                                       ▼
                                               ┌───────────────────┐
-                                              │  25-Frame Moving  │
-                                              │  Average + Trend  │
+                                            │  50-Frame Moving  │
+                                            │  Average + Trend  │
                                               └───────────────────┘
                                                       │
                                                       ▼
@@ -53,12 +55,13 @@ A real-time computer vision system that combines **liveness detection** (blink-b
 ### Detection Pipeline
 
 1. **Camera Capture** — Opens the default webcam using the AVFoundation backend (macOS-optimized).
-2. **Security Check** — Enumerates system cameras via `system_profiler` and flags virtual cameras.
+2. **Security Check** — Enumerates system cameras via `system_profiler` and flags virtual / non-native cameras. The project uses a zero-trust allowlist (native Apple sensors are trusted); untrusted cameras set a camera-trust signal which contributes to the unified fraud risk and may trigger an elevated final risk.
 3. **Face Landmark Tracking** — MediaPipe detects 468+ facial landmarks in real time.
 4. **Blink Detection** — Computes the Eye Aspect Ratio (EAR) from 6 eye landmarks per eye. EAR < 0.21 = eyes closed. A blink is detected on the rising edge (closed → open). After 1 blink, liveness is verified.
 5. **Proximity Gate** — If the face bounding box is smaller than 120px, inference is skipped and a warning is shown.
 6. **Deepfake Inference** — Every 15 frames, the face crop is sent to a background thread where the ViT model classifies it. Softmax is applied to the logits, and the "Fake" class probability is extracted.
-7. **Temporal Smoothing** — The raw probability is added to a 25-frame rolling buffer. The displayed score is the buffer mean, with a trend arrow showing direction of change.
+7. **Temporal Smoothing** — The raw probability is calibrated and added to a 50-frame rolling buffer. The displayed score is the buffer mean, with a trend arrow showing direction of change (small deltas → trend updates).
+8. **GradCAM (explainability)** — For elevated smoothed risk values the app computes a GradCAM heatmap over the face crop and blends it into the UI so users can see what regions influenced the prediction.
 
 ---
 
@@ -106,6 +109,10 @@ python3 liveness_detection.py
 - **Move closer** if you see the `WARNING: MOVE CLOSER TO CAMERA` banner.
 - Press **`q`** to quit.
 
+Notes on behavior:
+- A periodic challenge-response will be issued automatically (blink twice, turn head, look up). Passing a challenge reduces the challenge signal; failing increases it and contributes to the unified risk.
+- If an untrusted / virtual camera is detected the app marks the camera-trust signal and this can force the final risk to a critical level depending on other signals.
+
 ---
 
 ## 📁 Project Structure
@@ -130,6 +137,17 @@ These constants can be adjusted at the top of `main()` in `liveness_detection.py
 | `EAR_THRESHOLD` | `0.21` | EAR value below which eyes are considered closed |
 | `DEEPFAKE_INTERVAL` | `15` | Run deepfake inference every N frames |
 | `MIN_FACE_PX` | `120` | Minimum face bounding box size (px) to run inference |
+
+### Unified Risk Engine (weights)
+
+These weights are used to combine signals into the final fraud score in `liveness_detection.py`:
+
+| Weight constant | Default | Meaning |
+|---|---:|---|
+| `W_DEEPFAKE` | `0.45` | Weight for ViT deepfake signal |
+| `W_LIVENESS` | `0.30` | Weight for blink/recency liveness signal |
+| `W_CHALLENGE` | `0.15` | Weight for challenge-response signal |
+| `W_CAMERA` | `0.10` | Weight for camera-trust signal |
 
 ### Environment Variables
 
@@ -162,6 +180,8 @@ torch>=2.0                 # Neural network inference + MPS support
 torchvision>=0.15          # Image transforms
 transformers>=4.30         # HuggingFace ViT model loading
 huggingface-hub>=0.17      # Model downloading
+Pillow>=9.0                # Image conversions (PIL)
+pytorch-grad-cam>=1.4     # GradCAM for explainability
 ```
 
 ---
